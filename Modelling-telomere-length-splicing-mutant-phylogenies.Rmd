@@ -1,0 +1,830 @@
+---
+title: "Modelling telomere length in splicing factor-mutated CH"
+author: "William Dunn"
+date: "2023-11-23"
+output:
+  html_document:
+    df_print: paged
+  word_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_knit$set(root.dir = "/Users/williamdunn/Desktop/PhD/Phylogenies/Practice/")
+```
+
+```{r, echo = FALSE, message = FALSE, warning = FALSE}
+# Load libraries and read in datasets
+library(ggplot2)
+library(dplyr)
+library(stringr)
+library(openxlsx)
+library(ggtree)
+library(ape)
+library(FSA)
+library(MASS)
+library(lme4)
+library(flextable)
+library(grid)
+library(gridExtra)
+library(ggpattern)
+library(ggpubr)
+library(broom.mixed)
+library(performance)
+library(lmeresampler)
+library(sjPlot)
+library(forestplot)
+library(ggbeeswarm)
+
+# Scripts with helper functions from Nature papers by Fabre et al and Mitchell et al, available on Github
+source('/Users/williamdunn/Desktop/PhD/Phylogenies/Clonal_dynamics/my_functions/phylogeny_filters.R')
+source('/Users/williamdunn/Desktop/PhD/Phylogenies/Clonal_dynamics/my_functions/phylogeny_plot.R')
+
+# Read in data on telomere length and on batch effect
+telo3156 <- read.csv('dat/3156.telomerecat_length.N100.t75.n10.uncorrected.csv')
+telo3157 <- read.csv('dat/3157.telomerecat_length.N100.t75.n10.uncorrected.csv')
+batches <- read.csv('dat/batches.csv')
+redwhite1 <- read.csv('dat/PD34493_PD41082_colony_type_by_well.csv')
+redwhite2 <- read.xlsx('dat/PD48499_colony_colour_2022_timepoint.xlsx')
+redwhite1 <- redwhite1[,c(5,6)]
+redwhite2 <- redwhite2[,c(1,4)]
+colnames(redwhite1) <- c("sample", "colony_colour")
+colnames(redwhite2) <- c("sample", "colony_colour")
+
+redwhite <- rbind(redwhite1, redwhite2)
+rm(redwhite1)
+rm(redwhite2)
+
+TL.NGS.estimates <- rbind(telo3156, telo3157)
+
+TL.NGS.estimates$Sample <- str_remove(TL.NGS.estimates$Sample,".telbam.bam")
+
+TL.NGS.estimates <- TL.NGS.estimates[str_detect(TL.NGS.estimates$Sample,'PD41082') |
+                                       str_detect(TL.NGS.estimates$Sample,'PD34493') |
+                                       str_detect(TL.NGS.estimates$Sample,'PD48499'),]
+TL.NGS.estimates <- TL.NGS.estimates[!str_detect(TL.NGS.estimates$Sample,'j'),]
+TL.NGS.estimates <- TL.NGS.estimates[,colnames(TL.NGS.estimates) %in% c('Sample', 'Length', 'F1')]
+
+trees.to.analyse <- c("PD34493", "PD41082", "PD48499")
+
+plotting.info.list <- vector(mode = "list", length = length(trees.to.analyse))
+tree.list <- vector(mode = "list", length = length(trees.to.analyse))
+
+# Read in the trees
+for (j in 1:length(trees.to.analyse)){
+  if(trees.to.analyse[j] == "PD34493") { 
+    # Load in Marga's published tree
+    load(paste0("/Users/williamdunn/Desktop/PhD/Phylogenies/Clonal_dynamics/Phylogenies/Files/",
+                trees.to.analyse[j],'/trees/details'))
+    load(paste0("/Users/williamdunn/Desktop/PhD/Phylogenies/Clonal_dynamics/Phylogenies/Files/",
+                trees.to.analyse[j],'/trees/tree_ultra'))
+    tmp.tree <- tree_SNV_c_ultra
+    tmp.drivers <- details3[details3$coding_change_CHgene == "Coding change",]
+    colnames(tmp.drivers)[colnames(tmp.drivers) == "Gene"] <- "GENE" 
+    colnames(tmp.drivers)[colnames(tmp.drivers) == "Protein"] <- "HGVS_PROTEIN" 
+    tmp.drivers$VC <- "coding"
+    
+    tmp.tree.to.plot <- as.phylo(tmp.tree)
+  
+    tmp.drivers <- tmp.drivers[tmp.drivers$GENE %in% c('TET2','CBL','CUX1','NRAS',
+                                                 'NFE2','PPM1D','GNB1','SF3B1',
+                                                 'U2AF1', 'TP53') 
+                     & !is.na(tmp.drivers$GENE) & tmp.drivers$VC != 'intronic',]
+  
+    plotting.info <- vector(mode = "list", length = length(unique(tmp.drivers$GENE)))
+  
+    for (i in 1:length(plotting.info)){
+      driver.node <- tmp.drivers$node[i]
+      prot.change <- tmp.drivers$HGVS_PROTEIN[i]
+      mut <- paste0(tmp.drivers$GENE[i], ' ', prot.change)
+      samples <- get_samples_in_clade(driver.node, tmp.tree)
+      tmp.info <- data.frame(cbind(mut, samples, driver.node))
+      colnames(tmp.info) <- c('Mutation', 'Samples', 'Node')
+      plotting.info[[i]] <- tmp.info
+    }
+  } else {
+    tmp.dat <- readRDS(paste0('dat/trees_germline_branch_removed_190923/',trees.to.analyse[j],'_ultra.rds'))
+    #tmp.pdx <- tmp.dat$pdx
+    tmp.tree <- tmp.dat$ultratree
+    tmp.drivers <- tmp.dat$summary$driver
+    tmp.nodes <- tmp.dat$summary$node
+    
+    tmp.tree.to.plot <- as.phylo(tmp.tree)
+    
+    tmp.nodes  <- tmp.nodes[str_detect(tmp.drivers, 'TET2') | 
+                         #str_detect(tmp.drivers, 'CBL') | removed - none were true drivers
+                         str_detect(tmp.drivers, 'CUX1') |
+                         str_detect(tmp.drivers, 'NRAS') |
+                         str_detect(tmp.drivers, 'NFE2') |
+                         str_detect(tmp.drivers, 'PPM1D') |
+                         str_detect(tmp.drivers, 'GNB1') |
+                         str_detect(tmp.drivers, 'SF3B1') |
+                         str_detect(tmp.drivers, 'U2AF1')]
+  
+    tmp.drivers <- tmp.drivers[str_detect(tmp.drivers, 'TET2') | 
+                         #str_detect(tmp.drivers, 'CBL') |
+                         str_detect(tmp.drivers, 'CUX1') |
+                         str_detect(tmp.drivers, 'NRAS') |
+                         str_detect(tmp.drivers, 'NFE2') |
+                         str_detect(tmp.drivers, 'PPM1D') |
+                         str_detect(tmp.drivers, 'GNB1') |
+                         str_detect(tmp.drivers, 'SF3B1') |
+                         str_detect(tmp.drivers, 'U2AF1') |
+                         str_detect(tmp.drivers, 'TP53')]
+  
+    tmp.drivers <- str_replace(tmp.drivers, ":", " ")
+    plotting.info <- vector(mode = "list", length = length(unique(tmp.drivers)))
+  
+    for (i in 1:length(plotting.info)){
+      mut <- tmp.drivers[i]
+      driver.node <- tmp.nodes[i]
+      samples <- get_samples_in_clade(driver.node, tmp.tree)
+      tmp.info <- data.frame(cbind(mut, samples, driver.node))
+      colnames(tmp.info) <- c('Mutation', 'Samples', 'Node')
+      plotting.info[[i]] <- tmp.info
+    }
+  }
+  
+ 
+  
+  plotting.info.list[[j]] <- plotting.info
+  tree.list[[j]] <- tmp.tree.to.plot
+}
+
+plotting.info.list <- lapply(plotting.info.list, function(x) {do.call(rbind, x)})
+plotting.df <- do.call(rbind, plotting.info.list)
+
+plotting.df <- merge(plotting.df, TL.NGS.estimates, by.x = 'Samples', by.y = 'Sample', all.y = TRUE)
+
+get_tip_labels <- function(tree) {
+  return(tree$tip.label)
+}
+
+samples.in.trees <- unlist(lapply(tree.list, get_tip_labels))
+  
+plotting.df$Mutation <- as.factor(
+  case_when(
+    plotting.df$Mutation == "TET2 p.K33N" ~ "No CH mutation", # Unlikely true driver, n = 1 colony
+    !is.na(plotting.df$Mutation) ~ as.character(plotting.df$Mutation),
+    !plotting.df$Samples %in% samples.in.trees ~ "Not in tree",
+    TRUE ~ "No CH mutation"))
+
+
+plotting.df <- merge(plotting.df, batches[,c("Sample","run_id.uniq", "Seq.X")],
+                     by.x = 'Samples', by.y = 'Sample')
+
+modelling.df <- plotting.df
+
+modelling.df$Individual <- as.factor(str_extract(plotting.df$Samples, ".*(?=k_)"))
+modelling.df$Timepoint <- 1
+
+modelling.df$Timepoint[is.na(modelling.df$Individual)] <- 0
+modelling.df$Individual[is.na(modelling.df$Individual)] <- "PD48499"
+modelling.df$run_id.uniq <- as.factor(modelling.df$run_id.uniq)
+
+modelling.df <- merge(modelling.df, redwhite, all.x = TRUE, by.x = "Samples", by.y = "sample")
+modelling.df$colony_colour <- as.factor(modelling.df$colony_colour)
+```
+
+## Background 
+
+In our paper, we have analysed telomere length in individual colonies estimated from NovaSeq data using Telomerecat in three individuals. We firstly examine two individuals with clonal haematopoeisis bearing driver mutations in *SF3B1* (PD34493 and PD41082) and *U2AF1* (PD34493). We also have colonies from a third individual (PD48499), in whom we have longitudinal sampling at a first timepoint (24/96 colonies before filtering, when the individual had *SF3B1* mutated CCUS) and at a second timepoint four years later (72/96 colonies before filtering, when the individual had progressed to myelodysplastic syndrome).
+
+This script firstly examines confounders of NGS-estimated telomere length, before performing pairwise comparison of telomere lengths in splicing factor mutant vs driverless colonies. Lastly, we construct linear mixed effects models to model the impact of splicing and non-splicing driver mutations on telomere length at single-colony resolution, while adjusting for confounding factors. 
+
+## Examining possible confounders
+
+The main confounders that we have considered to date are batch effects from different sequencing runs (which seem to be depth-dependent) and red/white colony status (based on wet lab telomere length measurements from a single individual). Henceforth I will plot these for all colonies that pass the initial tree QC (as some colonies, for example, do not appear fully clonal and are discarded during phylogeny construction, hence their telomere length estimates are likely to be uninformative). 
+
+When examining telomere length split by batch, we can see that batch effects appear to be present across individuals, but less prominently in PD48499:
+
+```{r, echo = FALSE, warning = FALSE}
+sf1a <- ggplot(data = modelling.df[modelling.df$Mutation != "Not in tree",],
+       aes(x = run_id.uniq, y = Length, 
+           fill = run_id.uniq)) + 
+  labs(x = "Batch", y = "Length", fill = "Batch") + ylim(2500,5500) +
+  geom_boxplot() + geom_beeswarm() + facet_wrap(. ~ Individual, scales = "free_x") + theme_bw() + theme(legend.position = 'none')
+print(sf1a)
+```
+
+Consistent with this batch effect being depth-dependent, when we instead plot depth (Seq.X) against batch, the trend is reversed:
+
+```{r, echo = FALSE, warning = FALSE}
+sf1b <- ggplot(data = modelling.df[modelling.df$Mutation != "Not in tree",], 
+       aes(x = run_id.uniq, y = Seq.X, 
+           fill = run_id.uniq)) + 
+  labs(x = "Batch", y = "Depth", fill = "Batch") + ylim(8,21) +
+  geom_boxplot() + geom_beeswarm() + facet_wrap(. ~ Individual, scales = "free_x") + theme_bw() + theme(legend.position = 'none')
+print(sf1b)
+```
+
+We can also visualise this in greater detail by plotting sequencing depth versus length. This mirrors the boxplots above, as the disparity between batches is most obvious in PD34493, and colonies in the lower depth batch (Run 34580) tend to have longer telomere length estimates:
+
+```{r, echo = FALSE}
+ggplot(data = modelling.df[modelling.df$Mutation != "Not in tree",], 
+       aes(x = Seq.X, y = Length, 
+           colour = run_id.uniq)) + 
+  labs(x = "Depth", colour = "Batch") + 
+  geom_point() + facet_wrap(. ~ Individual, scales = "free_x") + theme_bw()
+```
+
+We next considered red vs white colony status as a possible confounder in telomere length estimates. Since *SF3B1* mutations cause a block late on in erythroid differentiation, we first examine the balance between red and white colonies according to *SF3B1* mutation status, per individual:
+
+```{r, echo = FALSE, warning = FALSE, message = FALSE}
+modelling.df %>% filter(Mutation != "Not in tree" & Timepoint == 1) %>% mutate(SF3B1_mutant = str_detect(Mutation, "SF3B1")) %>% group_by(Individual, SF3B1_mutant) %>% summarise(Number_of_colonies=n(), Percentage_red = round((sum(colony_colour == "R", na.rm = TRUE) / Number_of_colonies) * 100, 1)) %>% flextable(cwidth = 1.5)
+```
+
+The balance of red/white colonies is similar in PD34493, but *SF3B1* mutant cells are biased (surprisingly) towards white colonies in the other two individuals. 
+
+Examining telomere length by red/white colony status, we do not see large differences, and if anything, white colonies tend to have slightly shorter telomere lengths (the opposite of what we saw in PCR-based estimates): 
+
+```{r, echo = FALSE}
+sf1c <- ggplot(data = modelling.df[modelling.df$Mutation != "Not in tree" & !is.na(modelling.df$colony_colour),], 
+       aes(x = colony_colour, y = Length, 
+           fill = colony_colour)) + 
+  labs(x = "Colony colour", fill = "Colony colour") +
+  geom_boxplot() + geom_beeswarm() + facet_wrap(. ~ Individual, scales = "free_x") + theme_bw() + theme(legend.position = 'none')
+print(sf1c)
+```
+
+We can also look at differences in the depth between these colony types, to see if the variation might be attributable to this:
+
+```{r, echo = FALSE}
+sf1d <- ggplot(data = modelling.df[modelling.df$Mutation != "Not in tree" & !is.na(modelling.df$colony_colour),], 
+       aes(x = colony_colour, y = Seq.X, 
+           fill = colony_colour)) + 
+  labs(x = "Colony colour", y = "Depth", fill = "Colony colour") +
+  geom_boxplot() + geom_beeswarm() + facet_wrap(. ~ Individual, scales = "free_x") + theme_bw() + theme(legend.position = 'none')
+print(sf1d)
+```
+
+However, plotting depth-normalised F1 instead (F1 = completely telomeric reads, see Telomercat documentation), this trend is reversed: 
+
+```{r, echo = FALSE}
+ggplot(data = modelling.df[modelling.df$Mutation != "Not in tree" & !is.na(modelling.df$colony_colour),], 
+       aes(x = colony_colour, y = F1 / Seq.X, 
+           fill = colony_colour)) + 
+  labs(x = "Colony colour", fill = "Colony colour") +
+  geom_boxplot() + geom_beeswarm() + facet_wrap(. ~ Individual, scales = "free_x") + theme_bw()
+```
+
+We can also see that when we compare within batches, the differences in length estimates are small, with the exception of the second batch for PD48499, which only has three samples and is therefore prone to biased estimates: 
+
+```{r, echo = FALSE}
+sf1e <- ggplot(data = modelling.df[modelling.df$Mutation != "Not in tree" & !is.na(modelling.df$colony_colour),], 
+       aes(x = colony_colour, y = Length, 
+           fill = colony_colour)) + 
+  labs(x = "Colony colour", fill = "Colony colour") +
+  geom_boxplot() + geom_beeswarm() + facet_wrap(. ~ Individual + run_id.uniq, scales = "free_x") + theme_bw() + theme(legend.position = 'none')
+print(sf1e)
+```
+
+We can also observe the association with batch and red/white colony status:
+
+```{r, echo = FALSE}
+freq_table <- as.data.frame.matrix(table(modelling.df$run_id.uniq[modelling.df$Mutation != "Not in tree" & !is.na(modelling.df$colony_colour)],
+                                    modelling.df$colony_colour[modelling.df$Mutation != "Not in tree" & !is.na(modelling.df$colony_colour)]))
+
+freq_table$prop_red <- freq_table$R / (freq_table$R + freq_table$W)
+
+freq_table$batch <- as.factor(rownames(freq_table))
+
+freq_table$Individual <- factor(case_when(freq_table$batch %in% c("34421", "34580") ~ "PD34493",
+                                          freq_table$batch %in% c("39265", "39266") ~ "PD41082",
+                                          TRUE ~ "PD48499"))
+
+freq_table$batch_num <- factor(case_when(freq_table$batch %in% c("34421", "39265", "46958") ~ "batch1",
+                                          TRUE ~ "batch2"))
+
+ggplot(data = freq_table, 
+       aes(x = Individual, y = batch_num, 
+           fill = prop_red)) + scale_fill_gradient(low = "pink", high = "red") +
+  geom_tile() + theme_bw()
+```
+
+And how the presence of a splicing mutation relates to the proportion of erythroid colonies in each individual:
+
+```{r, echo = FALSE}
+modelling.df$Mutation_type <- as.factor(case_when(modelling.df$Mutation == "No CH mutation" ~ "No_driver",
+                                        modelling.df$Mutation == "Not in tree" ~ "Not in tree",
+                                        str_detect(modelling.df$Mutation, "SF3B1") ~ "Splicing",
+                                        str_detect(modelling.df$Mutation, "U2AF1") ~ "Splicing",
+                                        str_detect(modelling.df$Mutation, "TET2") ~ "Other_driver",
+                                        str_detect(modelling.df$Mutation, "GNB1") ~ "Other_driver",
+                                        str_detect(modelling.df$Mutation, "NRAS") ~ "Other_driver",
+                                        str_detect(modelling.df$Mutation, "NFE2") ~ "Other_driver",
+                                        str_detect(modelling.df$Mutation, "CUX1") ~ "Other_driver",
+                                        TRUE ~ "No_driver"))
+
+final.modelling.df <- modelling.df[modelling.df$Mutation_type != "Not in tree",]
+colnames(final.modelling.df)[colnames(final.modelling.df) == "run_id.uniq"] <- "batch"
+final.modelling.df$Mutation_type <- as.factor(as.character(final.modelling.df$Mutation_type))
+
+# Remove duplicate samples - these occur when the sample has >1 driver and are only present in PD41082
+final.modelling.df <- final.modelling.df[!duplicated(final.modelling.df$Samples),]
+
+final.modelling.df$Age <- case_when(final.modelling.df$Individual == "PD34493" ~ 80.3,
+                                    final.modelling.df$Individual == "PD41082" ~ 73.9,
+                                    final.modelling.df$Individual == "PD48499" & final.modelling.df$Timepoint == 0 ~ 50.2,
+                                    TRUE ~ 53.8)
+
+freq_table <- modelling.df %>% filter(Mutation != "Not in tree" & !is.na(colony_colour)) %>% group_by(Individual, Mutation_type) %>% summarise(n_red = sum(colony_colour == "R"), prop_red = n_red / n())
+
+ggplot(data = freq_table[freq_table$Mutation_type != "Other_driver",], 
+       aes(x = Individual, y = Mutation_type, 
+           fill = prop_red)) + scale_fill_gradient(low = "pink", high = "red") +
+  geom_tile() + theme_bw()
+```
+
+We can examine the association between driver and depth:
+
+```{r, echo = FALSE}
+ggplot(data = modelling.df[modelling.df$Mutation != "Not in tree" & !is.na(modelling.df$colony_colour) & modelling.df$Mutation %in% c("No CH mutation", "SF3B1 p.K666N", "SF3B1 p.K700E", "U2AF1 p.Q157R"),], 
+       aes(x = Mutation, y = Seq.X, 
+           fill = Mutation)) + 
+  geom_boxplot() + facet_wrap(. ~ Individual, scales = "free_x") + theme_bw()
+```
+
+This obviously suggests that the are differences in telomere length estimates between red and white colonies are at least in part driven by differences in sequencing depth (as we see with the batch effect), and this is indeed what we see when plotting sequencing depth versus red/white status, where this is quite markedly different in two of the individuals:
+
+```{r, echo = FALSE}
+ggplot(data = modelling.df[modelling.df$Mutation != "Not in tree" & !is.na(modelling.df$colony_colour),], 
+       aes(x = colony_colour, y = Seq.X, 
+           fill = colony_colour)) + 
+  geom_boxplot() + facet_wrap(. ~ Individual, scales = "free_x") + theme_bw()
+```
+
+## Mixed effects models of NGS-estimated telomere length
+
+We build linear mixed-effects models to model the effect of genotype (splicing/conventional/no driver) on telomere length, accounting for confounders (batch effects, capturing depth-dependent and other variation) and age. Firstly, we sequentially add confounding terms to a null model (developed using the driverless colonies initially):
+
+```{r, echo = FALSE}
+modelling.df$Mutation_type <- as.factor(case_when(modelling.df$Mutation == "No CH mutation" ~ "No_driver",
+                                        modelling.df$Mutation == "Not in tree" ~ "Not in tree",
+                                        str_detect(modelling.df$Mutation, "SF3B1") ~ "Splicing",
+                                        str_detect(modelling.df$Mutation, "U2AF1") ~ "Splicing",
+                                        str_detect(modelling.df$Mutation, "TET2") ~ "Other_driver",
+                                        str_detect(modelling.df$Mutation, "GNB1") ~ "Other_driver",
+                                        str_detect(modelling.df$Mutation, "NRAS") ~ "Other_driver",
+                                        str_detect(modelling.df$Mutation, "NFE2") ~ "Other_driver",
+                                        str_detect(modelling.df$Mutation, "CUX1") ~ "Other_driver",
+                                        TRUE ~ "No_driver"))
+
+final.modelling.df <- modelling.df[modelling.df$Mutation_type != "Not in tree",]
+colnames(final.modelling.df)[colnames(final.modelling.df) == "run_id.uniq"] <- "batch"
+final.modelling.df$Mutation_type <- as.factor(as.character(final.modelling.df$Mutation_type))
+
+# Remove duplicate samples - these occur when the sample has >1 driver and are only present in PD41082
+final.modelling.df <- final.modelling.df[!duplicated(final.modelling.df$Samples),]
+
+final.modelling.df$Age <- case_when(final.modelling.df$Individual == "PD34493" ~ 80.3,
+                                    final.modelling.df$Individual == "PD41082" ~ 73.9,
+                                    final.modelling.df$Individual == "PD48499" & final.modelling.df$Timepoint == 0 ~ 50.2,
+                                    TRUE ~ 53.8)
+```
+
+We build the null model iteratively using the wild-type colonies initially. We are not using individual as a random effect, as this is captured by including batch, of which each individual has two and which are unique to that individual (that is, the batch variable is nested within the individual variable):
+
+```{r}
+null.model <- lmer(Length ~ Age + (1 | batch), data = final.modelling.df[final.modelling.df$Mutation_type == "No_driver" & !is.na(final.modelling.df$colony_colour),])
+
+all.fit.null.model <- allFit(null.model)
+
+broom.mixed::glance(all.fit.null.model) %>% dplyr::select(optimizer, AIC, BIC, NLL_rel)  %>%  arrange(NLL_rel)
+```
+
+We can also incorporate red/white colony status in our null model: 
+
+```{r}
+null.model.rw <- lmer(Length ~ Age + (1 | batch) + (1 | colony_colour), data = final.modelling.df[final.modelling.df$Mutation_type == "No_driver" & !is.na(final.modelling.df$colony_colour),])
+
+all.fit.null.model.rw <- allFit(null.model.rw)
+
+broom.mixed::glance(all.fit.null.model.rw) %>% dplyr::select(optimizer, AIC, BIC, NLL_rel)  %>%  arrange(NLL_rel)
+```
+
+And we can then compare whether or not the addition of colony type improves the model:
+
+```{r}
+comparison <- anova(null.model, null.model.rw)
+
+print(comparison)
+```
+
+This demonstrates that this does not improve our model, and thus we have not added this variable going forward. 
+
+We can fit the null model on the wild-type colonies without issue, incorporating batch as a random effect and age as a fixed effect. We will firstly check that it has converged and is not singular (which suggests the model is too complex for the data, hence the estimates cannot be trusted). We base this on the best optimiser version of the model, which was bobyqa above:
+
+```{r}
+isSingular(all.fit.null.model$bobyqa)
+```
+
+```{r}
+check_convergence(all.fit.null.model$bobyqa)
+```
+
+We now fit this on the whole data (that is, including colonies bearing driver mutations):
+
+```{r}
+null.model <- lmer(Length ~ Age + (1 | batch), data = final.modelling.df)
+
+all.fit.null.model <- allFit(null.model)
+
+broom.mixed::glance(all.fit.null.model) %>% dplyr::select(optimizer, AIC, BIC, NLL_rel)  %>%  arrange(NLL_rel)
+```
+
+We can once again check it is not singular:
+
+```{r}
+isSingular(all.fit.null.model$bobyqa)
+```
+
+And has converged:
+
+```{r}
+check_convergence(all.fit.null.model$bobyqa)
+```
+
+Now, we can build the alternative model, with genotype (Splicing/Conventional/No driver) as a fixed effect:
+
+```{r}
+alternative.model <- lmer(Length ~ Mutation_type + Age + (1 | batch), data = final.modelling.df)
+
+all.fit.alternative.model <- allFit(alternative.model)
+
+broom.mixed::glance(all.fit.alternative.model) %>% dplyr::select(optimizer, AIC, BIC, NLL_rel)  %>%  arrange(NLL_rel)
+```
+
+Check that it is not singular:
+
+```{r}
+isSingular(all.fit.alternative.model$bobyqa)
+```
+
+And has converged:
+
+```{r}
+check_convergence(all.fit.alternative.model$bobyqa)
+```
+
+And compare the models:
+
+```{r}
+comparison <- anova(null.model, alternative.model)
+
+print(comparison)
+```
+
+```{r}
+summary(alternative.model)
+```
+
+Note that the coefficient for the age effect on telomere length is -15bp per year. When we fitted this on just the wild-type colonies, it approximated the described difference in the Mitchell et al. Nature paper (coefficient = -28bp/year). We did try alternatives to the above model, e.g. fitting a random slope for batch in addition to a random intercept, assuming that the slope varies with age, but this model becomes singular, as it does when adding other more complex terms (e.g. fitting a random slope for Mutation type, or introducing batch as nested within individual). Ideally, we would have included such terms, but our small sample size precludes this:
+
+```{r}
+alternative.model2 <- lmer(Length ~ Mutation_type + Age + (1 + Age | batch), data = final.modelling.df)
+
+all.fit.alternative.model2 <- allFit(alternative.model2)
+
+broom.mixed::glance(all.fit.alternative.model2) %>% dplyr::select(optimizer, AIC, BIC, NLL_rel)  %>%  arrange(NLL_rel)
+```
+
+```{r}
+summary(alternative.model2)
+```
+
+We can now calculate bootstrap estimates for the effect size of each fixed effect:
+
+```{r}
+set.seed(1234)
+
+alternative.model.boot <-
+  bootstrap(
+    alternative.model,
+    .f = fixef,
+    type = "parametric",
+    B = 10000
+  )
+```
+
+```{r}
+lmeresampler:::confint.lmeresamp(alternative.model.boot, type = "perc") %>% tab_df()
+```
+
+We can also limit this to the first 5000 converged models:
+
+```{r}
+keep.vec <- sapply(alternative.model.boot$message, is.null) & sapply(alternative.model.boot$warning, is.null) & sapply(alternative.model.boot$error, is.null)
+
+
+alternative.model.boot2 <- alternative.model.boot
+alternative.model.boot2$replicates <- alternative.model.boot2$replicates[keep.vec, ][1:5000,]
+tbl.for.paper <- lmeresampler:::confint.lmeresamp(alternative.model.boot2, type = "perc") 
+tbl.for.paper <- tbl.for.paper[-1,-5]
+tbl.for.paper$term <- c("Non-splicing driver", "Splicing driver", "Age")
+colnames(tbl.for.paper) <- c("Term", "Estimate", "Lower", "Upper", "Confidence")
+
+tbl.for.paper %>% tab_df(file = "/Users/williamdunn/Desktop/PhD/Telomere_paper/Table1.html")
+```
+
+We can visualise these in a Forest plot (I have removed age since it is on a very different scale):
+
+```{r, echo = FALSE, message = FALSE, warning = FALSE}
+forest.plot <- tbl.for.paper[-3,] |> forestplot(labeltext = Term,
+                            mean = Estimate, 
+                            lower = Lower, 
+                            upper = Upper,
+                            title = "Mutation versus colony telomere length") |> 
+  fp_set_style(box = "royalblue",
+               line = "darkblue",
+               summary = "royalblue")
+
+print(forest.plot)
+```
+
+## Annotation of phylogenies with NGS-estimated telomere length 
+
+Here, we plot ultrametric phylogenetic trees and annotate them with NGS-estimated telomere lengths. We additionally annotate trees with driver mutations; I have removed driver labels for unexpanded clades to avoid over-plotting. 
+
+```{r, fig.width=8.5, fig.height=11, echo=FALSE, warning=FALSE, message=FALSE}
+tree.list[[1]]$edge.length <- tree.list[[1]]$edge.length * 83.8 # Correct the scale on Marga's tree
+
+plotting.df$Mutation <- as.factor(ifelse(plotting.df$Mutation %in% c("CBL -",
+                                                                     "CBL p.?",
+                                                                     "CBL p.I199V",
+                                                                     "NFE2 p.S44fs*2",
+                                                                     "NFE2 -"), "No CH mutation",
+                               as.character(plotting.df$Mutation)))
+
+plotting.df <- plotting.df[!duplicated(plotting.df$Samples),]
+
+plot_tree_length <- function(tree.to.plot, plotting.df, individual) {
+  drivers <- plotting.df[!is.na(plotting.df$Node) &
+                           plotting.df$Mutation != "No CH mutation" &
+                           plotting.df$Individual == individual,c("Node","Mutation")]
+  
+  drivers <- drivers[drivers$Mutation != "TET2 p.K33N" &
+                       drivers$Mutation != "TET2 p.Q317fs*30,CBL:p.R462*" &
+                       drivers$Mutation != "TET2 p.H436fs*11" &
+                       drivers$Mutation != "TET2 p.R1440fs*38" &
+                       drivers$Mutation !="TET2 p.T443fs*11" &
+                       drivers$Mutation != "TET2 p.Q1274R",] # Remove for aesthetic purposes - these represent 7 colonies
+  
+  colnames(drivers) <- c("node", "Variant_ID")
+  drivers$node <- as.integer(drivers$node)
+  
+  p <- ggtree(tree.to.plot)
+  p <- p + geom_facet(panel = "Length", data = plotting.df, geom = geom_col, 
+                    mapping = aes(x = Length, 
+                                  fill = Mutation), 
+                    orientation = 'y', width = .6) + theme_tree2()
+  p <- p %<+% plotting.df[c("Samples","Mutation", "Length")] +
+    geom_tippoint(aes(color=Mutation)) + scale_colour_manual(values = c("No CH mutation" = "#F8766D", "SF3B1 p.K666N" = "#00BA38", "SF3B1 p.K700E" = "#00BA38", "U2AF1 p.Q157R" = "#619CFF"), na.value = "#F8766D") + scale_fill_manual(values = c("No CH mutation" = "#F8766D", "SF3B1 p.K666N" = "#00BA38", "SF3B1 p.K700E" = "#00BA38", "U2AF1 p.Q157R" = "#619CFF"), na.value = "#F8766D") + 
+    theme(legend.position = "none", axis.text.x = element_text(size = 7))
+    p <- p %<+% drivers + geom_label(aes(label = Variant_ID), hjust = 0.6, size = 1.8, fontface = "bold")
+  return(p)
+}
+
+plotting.df$SF3B1 <- as.factor(ifelse(str_detect(plotting.df$Mutation, "SF3B1"), "SF3B1_Mutant", "WT"))
+
+individuals <- unique(modelling.df$Individual)
+ages <- c("83.8 year old male", ": 73.9 year old female", ": 50.2/53.8 year old male")
+
+plotting.df$Individual <- as.factor(str_extract(plotting.df$Samples, ".*(?=k_)"))
+plotting.df$Individual[is.na(plotting.df$Individual)] <- "PD48499"
+
+boxplot.list.length <- vector(mode = "list", length = length(individuals))
+
+for (i in 1:length(individuals)) {
+  boxplot.list.length[[i]] <- ggplot(data = plotting.df[plotting.df$Mutation %in% c("No CH mutation", "SF3B1 p.K666N", "SF3B1 p.K700E") & plotting.df$Individual == individuals[i],], 
+       aes(x = SF3B1, y = Length, fill = SF3B1)) + 
+  geom_boxplot(outlier.shape = NA) + ggtitle(paste0(individuals[i], ages[i])) + geom_jitter() +
+    ylim(2200,5100) +
+  scale_fill_manual(values = c("#00BA38", "#F8766D")) + theme_bw() + 
+  theme(axis.text.x = element_text(size = 14), 
+        axis.text.y = element_text(size = 14),
+        axis.title = element_text(size=14,face="bold"),
+        title = element_text(size=10,face="bold"),
+        legend.position = "none")
+}
+```
+
+```{r, fig.width=8.25, fig.height=11.5, echo=FALSE, warning=FALSE, message=FALSE}
+plots.list.length <- vector(mode = "list", length = length(tree.list))
+
+for (i in 1:length(plots.list.length)) {
+  plots.list.length[[i]] <- plot_tree_length(tree.list[[i]],
+                                             plotting.df, 
+                                             individuals[[i]])
+}
+
+plotting.df$Driver <- as.factor(ifelse(str_detect(plotting.df$Mutation, "SF3B1"), "SF3B1",
+                                      ifelse(str_detect(plotting.df$Mutation, "U2AF1"), "U2AF1","WT")))
+
+individuals <- unique(modelling.df$Individual)
+ages <- c("83.8 year old male", "73.9 year old female", "50.2/53.8 year old male")
+
+plotting.df$Individual <- as.factor(str_extract(plotting.df$Samples, ".*(?=k_)"))
+plotting.df$Individual[is.na(plotting.df$Individual)] <- "PD48499"
+
+plotting.df$SF3B1_timepoint <- factor(case_when(plotting.df$SF3B1 == "SF3B1_Mutant" &
+                                           str_detect(plotting.df$Samples, "_18_") ~ "SF3B1 Mutant 2018",
+                                         plotting.df$SF3B1 == "WT" &
+                                           str_detect(plotting.df$Samples, "_18_") ~ "SF3B1 WT 2018",
+                                         plotting.df$SF3B1 == "SF3B1_Mutant" &
+                                           str_detect(plotting.df$Samples, "_22_") ~ "SF3B1 Mutant 2022",
+                                         plotting.df$SF3B1 == "WT" &
+                                           str_detect(plotting.df$Samples, "_22_") ~ "SF3B1 WT 2022",
+                                         TRUE ~ NA), levels = c("SF3B1 Mutant 2018", "SF3B1 Mutant 2022",
+                                                                "SF3B1 WT 2018", "SF3B1 WT 2022"))
+
+plotting.df$timepoint <- case_when(str_detect(plotting.df$Samples, "_18_") ~ "50.2",
+                                   str_detect(plotting.df$Samples, "_22_") ~ "53.8",
+                                   TRUE ~ NA)
+
+boxplot.list.length <- vector(mode = "list", length = length(individuals))
+
+for (i in 1:length(individuals)) {
+  if (individuals[i] == "PD48499") {
+    boxplot.list.length[[i]] <- ggplot(data = plotting.df[plotting.df$Mutation %in% c("No CH mutation", "SF3B1 p.K666N", "SF3B1 p.K700E") & plotting.df$Individual == individuals[i],], 
+       aes(x = timepoint, y = Length, fill = SF3B1)) + 
+  geom_boxplot(outlier.shape = NA) + ggtitle(paste0(individuals[i], "\n", ages[i])) + 
+  geom_beeswarm() + ylim(2200,5100) +
+  xlab("") +
+  scale_fill_manual(values = c("#00BA38", "#F8766D")) + theme_bw() +
+  theme(axis.text.x = element_text(size = 12, face = "bold"), 
+        axis.text.y = element_text(size = 14),
+        axis.title = element_text(size=14,face="bold"),
+        title = element_text(size=10,face="bold"), 
+        legend.position = "none",
+        strip.background = element_blank(),
+        strip.text.x = element_blank()) +
+  stat_compare_means(aes(group = timepoint), label = "p.format") +
+  facet_wrap(~SF3B1)
+  } else if (individuals[[i]] == "PD34493") {
+    my_comparisons <- list( c("WT", "SF3B1"), 
+                            c("WT", "U2AF1"))
+    boxplot.list.length[[i]] <- ggplot(data = plotting.df[plotting.df$Mutation %in% c("No CH mutation", "SF3B1 p.K666N", "SF3B1 p.K700E", "U2AF1 p.Q157R") & plotting.df$Individual == individuals[i],], 
+       aes(x = Driver, y = Length, fill = Driver)) + 
+  geom_boxplot(outlier.shape = NA) + ggtitle(paste0(individuals[i], "\n", ages[i])) + 
+    geom_beeswarm() + ylim(2200,5100) + 
+    xlab("") +
+    scale_fill_manual(values = c("SF3B1" = "#00BA38",
+                               "WT" = "#F8766D", 
+                               "U2AF1" = "#619CFF")) + theme_bw() + 
+    theme(axis.text.x = element_text(size = 12, face = "bold"), 
+          axis.text.y = element_text(size = 14),
+          axis.title = element_text(size=14,face="bold"),
+          title = element_text(size=10,face="bold"),
+          legend.position = "none") + stat_compare_means(comparisons = my_comparisons, label = "p.format")
+  } else {
+    
+    boxplot.list.length[[i]] <- ggplot(data = plotting.df[plotting.df$Mutation %in% c("No CH mutation", "SF3B1 p.K666N", "SF3B1 p.K700E", "U2AF1 p.Q157R") & plotting.df$Individual == individuals[i],], 
+       aes(x = Driver, y = Length, fill = Driver)) + 
+  geom_boxplot(outlier.shape = NA) + ggtitle(paste0(individuals[i], "\n", ages[i])) + 
+    geom_beeswarm() + ylim(2200,5100) + 
+    xlab("") +
+    scale_fill_manual(values = c("SF3B1" = "#00BA38",
+                               "WT" = "#F8766D", 
+                               "U2AF1" = "#619CFF")) + theme_bw() + 
+    theme(axis.text.x = element_text(size = 12, face = "bold"), 
+          axis.text.y = element_text(size = 14),
+          axis.title = element_text(size=14,face="bold"),
+          title = element_text(size=10,face="bold"),
+          legend.position = "none") + stat_compare_means(label = "p.format")
+  }
+}
+
+do.call(grid.arrange, c(c(plots.list.length, boxplot.list.length), ncol = 3))
+```
+
+We can also plot the comparison with the *U2AF1* mutant clade and progressively more closely related wild-type clades:
+
+```{r, fig.width=8.25, fig.height=11.5, echo=FALSE, warning=FALSE, message=FALSE}
+tree.list.u2af1.length <- vector(mode = "list", length = 3)
+boxplot.list.u2af1.length <- vector(mode = "list", length = 3)
+
+nodes.to.plot <- c(99, 100, 101)
+
+for (i in 1:length(nodes.to.plot)){
+  # Use the get node children to edit the drivers df 
+  # Colour all the children of the relevant node pink if they are no CH mutation
+  # All others should be grey - perhaps set mutation to "not measured"
+  drivers <- plotting.df[!is.na(plotting.df$Node) &
+                           plotting.df$Mutation != "No CH mutation" &
+                           plotting.df$Individual == "PD34493",c("Node","Mutation")]
+  
+  colnames(drivers) <- c("node", "Variant_ID")
+  drivers$node <- as.integer(drivers$node)
+  
+  tmp.u2af1.df <- plotting.df[plotting.df$Samples %in% tree.list[[1]]$tip.label,]
+  
+  tmp.samples <- get_samples_in_clade(nodes.to.plot[i], tree.list[[1]])
+  tmp.u2af1.df$Mutation <- factor(
+    case_when(tmp.u2af1.df$Mutation == "U2AF1 p.Q157R" ~ "U2AF1",
+              tmp.u2af1.df$Samples %in% tmp.samples ~ "Related",
+              TRUE ~ "Unrelated"),
+    levels = c("U2AF1", "Related", "Unrelated")
+    )
+  
+  # Plot the trees
+  p <- ggtree(tree.list[[1]])
+  p <- p + geom_facet(panel = "Length", data = tmp.u2af1.df, geom = geom_col, 
+                    mapping = aes(x = Length, 
+                                  fill = Mutation), 
+                    orientation = 'y', width = .6) + theme_tree2()
+  p <- p %<+% tmp.u2af1.df[c("Samples","Mutation", "Length")] +
+    geom_tippoint(aes(color=Mutation)) + scale_colour_manual(values = c("Related" = "#F8766D", "Unrelated" = "lightgrey", "U2AF1" = "#619CFF"), na.value = "#999999") + scale_fill_manual(values = c("Related" = "#F8766D", "Unrelated" = "lightgrey", "U2AF1" = "#619CFF"), na.value = "#999999") + 
+    theme(legend.position = "none", axis.text.x = element_text(size = 7))
+    p <- p %<+% drivers + geom_label(aes(label = Variant_ID), hjust = 0.6, size = 1.8, fontface = "bold")
+    tree.list.u2af1.length[[i]] <- p
+    
+    # Plot the boxplots
+    boxplot.list.u2af1.length[[i]] <- ggplot(data = tmp.u2af1.df, 
+       aes(x = Mutation, y = Length, fill = Mutation)) + 
+  geom_boxplot(outlier.shape = NA) + geom_beeswarm() +
+    ylim(2200,5100) + xlab("") +
+  scale_fill_manual(values = c("Related" = "#F8766D", "Unrelated" = "lightgrey", "U2AF1" = "#619CFF")) + theme_bw() + 
+  theme(axis.text.x = element_text(size = 9.5, face = "bold"), 
+          axis.text.y = element_text(size = 14),
+          axis.title = element_text(size=14,face="bold"),
+          title = element_text(size=10,face="bold"),
+          legend.position = "none") + stat_compare_means(comparisons = list(c("U2AF1", "Related")))
+}
+
+pdf("/Users/williamdunn/Desktop/PhD/Telomere_paper/PD34493_U2AF1_clade_pairwise_comparisons.pdf",
+    width = 8.27, height = 11.69)
+do.call(grid.arrange, c(c(tree.list.u2af1.length, boxplot.list.u2af1.length), ncol = 3))
+dev.off()
+
+do.call(grid.arrange, c(c(tree.list.u2af1.length, boxplot.list.u2af1.length), ncol = 3))
+
+```
+
+We can generate the exact p value for the pairwise comparisons using the Wilcoxon rank sum test:
+
+```{r}
+for (i in 1:length(individuals)){
+  tmp.df <- plotting.df[plotting.df$Mutation %in% c("No CH mutation", "SF3B1 p.K666N", "SF3B1 p.K700E", "U2AF1 p.Q157R") & plotting.df$Individual == individuals[i],]
+  tmp.res <- tmp.df %>% group_by(Mutation) %>% summarise(meanTL = mean(Length), medianTL = median(Length), minTL = min(Length), maxTL = max(Length), n = n())
+  print(tmp.res)
+  
+  if (individuals[i] == "PD34493"){
+    # Compare WT with both SF3B1 and U2AF1 mutant
+    tmp.pval.sf3b1 <- wilcox.test(x = tmp.df$Length[tmp.df$Mutation == "No CH mutation"],
+                            y = tmp.df$Length[tmp.df$Mutation == "SF3B1 p.K666N"])
+  tmp.pval.u2af1 <- wilcox.test(x = tmp.df$Length[tmp.df$Mutation == "No CH mutation"],
+                            y = tmp.df$Length[tmp.df$Mutation == "U2AF1 p.Q157R"])
+  print(paste0("For ", individuals[i], ", the p value for SF3B1 mutant vs SF3B1/U2AF1 WT is: ", tmp.pval.sf3b1$p.value, " and for U2AF1 mutant vs SF3B1/U2AF1 WT is: ", tmp.pval.u2af1$p.value))
+  } else {
+    # Just compare SF3B1 mutant vs WT
+    tmp.pval <- wilcox.test(x = tmp.df$Length[tmp.df$Mutation == "No CH mutation"],
+                            y = tmp.df$Length[tmp.df$Mutation != "No CH mutation"])
+    print(paste0("For ", individuals[i], ", the p value for SF3B1 mutant vs WT is: ", tmp.pval$p.value))
+  }
+}
+```
+
+We can also plot orthogonal qPCR estimates for PD34493 and plot this as a supplemental figure versus the NGS estimates:
+
+```{r, echo = FALSE, message = FALSE, warning = FALSE}
+qpcr <- read.xlsx("/Users/williamdunn/Desktop/PhD/Telomere_paper/2024-01-15_pd34493-r3_telo-qPCR_data.xlsx")
+
+qpcr$mutation <- factor(case_when(qpcr$mutation == "sf3b1_mut" ~ "SF3B1",
+                                  qpcr$mutation == "u2af1_mut" ~ "U2AF1", 
+                                  TRUE ~ "WT"), levels = c("SF3B1", "U2AF1", "WT"))
+
+sf2a <- ggplot(data = qpcr, aes(x = mutation, y = t_s_ratio, fill = mutation)) + 
+  geom_boxplot(outlier.shape = NA) + 
+  geom_beeswarm() +
+  scale_x_discrete() + 
+  labs(x = "", y = "T/S ratio") +
+  scale_fill_manual(values = c("SF3B1" = "#00BA38",
+                               "WT" = "#F8766D", 
+                               "U2AF1" = "#619CFF")) +
+  ggtitle("PD34493 telomere length by qPCR") +
+  theme_bw() + 
+  theme(axis.text.x = element_text(size = 12, face = "bold"), 
+        axis.text.y = element_text(size = 14),
+        axis.title = element_text(size=14,face="bold"),
+        title = element_text(size=10,face="bold"),
+        legend.position = "none") + stat_compare_means(comparisons = my_comparisons, label = "p.signif")
+
+sf2b <- ggplot(data = plotting.df[plotting.df$Mutation %in% c("No CH mutation", "SF3B1 p.K666N", "SF3B1 p.K700E", "U2AF1 p.Q157R") & plotting.df$Individual == "PD34493",], 
+       aes(x = Driver, y = Length, fill = Driver)) + 
+  geom_boxplot(outlier.shape = NA) + ggtitle("PD34493 telomere length from NGS") + 
+    geom_beeswarm() + ylim(2200,5100) + 
+    xlab("") +
+    scale_fill_manual(values = c("SF3B1" = "#00BA38",
+                               "WT" = "#F8766D", 
+                               "U2AF1" = "#619CFF")) + theme_bw() + 
+    theme(axis.text.x = element_text(size = 12, face = "bold"), 
+          axis.text.y = element_text(size = 14),
+          axis.title = element_text(size=14,face="bold"),
+          title = element_text(size=10,face="bold"),
+          legend.position = "none") + stat_compare_means(comparisons = my_comparisons, label = "p.signif")
+
+grid.arrange(sf2a, sf2b, ncol = 2)
+```
+
+
